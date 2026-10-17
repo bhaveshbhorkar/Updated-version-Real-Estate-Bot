@@ -1,5 +1,6 @@
 import os
 import random
+import time
 
 import pandas as pd
 import plotly.express as px
@@ -13,6 +14,7 @@ st.markdown("<style>.block-container{padding-top:1.4rem;max-width:1200px}</style
 HOST = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
 TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 ENDPOINT = os.environ.get("SERVING_ENDPOINT", "")
+WAREHOUSE = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 if HOST and not HOST.startswith("http"):
     HOST = "https://" + HOST
 MAX_Q = 20
@@ -54,16 +56,51 @@ components.html(HERO.replace("__SKY__", skyline()), height=310)
 
 
 # ---------- data ----------
-@st.cache_data
-def load(name):
-    return pd.read_csv(f"data/{name}.csv")
+NUMERIC = {"BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE", "DECIMAL"}
 
 
+@st.cache_data(ttl=600, show_spinner="Reading live data from Databricks. This can take a minute if the warehouse is starting.")
+def query(table):
+    h = {"Authorization": f"Bearer {TOKEN}"}
+    r = requests.post(f"{HOST}/api/2.0/sql/statements", headers=h, timeout=60, json={
+        "warehouse_id": WAREHOUSE, "statement": f"SELECT * FROM workspace.semantic.{table}",
+        "wait_timeout": "50s", "on_wait_timeout": "CONTINUE"})
+    r.raise_for_status()
+    j, t0 = r.json(), time.time()
+    while j["status"]["state"] in ("PENDING", "RUNNING") and time.time() - t0 < 180:
+        time.sleep(3)
+        j = requests.get(f"{HOST}/api/2.0/sql/statements/{j['statement_id']}", headers=h, timeout=60).json()
+    if j["status"]["state"] != "SUCCEEDED":
+        raise RuntimeError(j["status"].get("error", {}).get("message", j["status"]["state"]))
+    cols = j["manifest"]["schema"]["columns"]
+    df = pd.DataFrame(j.get("result", {}).get("data_array", []), columns=[c["name"] for c in cols])
+    for c in cols:
+        if c["type_name"] in NUMERIC:
+            df[c["name"]] = pd.to_numeric(df[c["name"]])
+    return df
+
+
+def get(name, table):
+    live_err = None
+    if HOST and TOKEN and WAREHOUSE:
+        try:
+            return query(table)
+        except Exception as e:
+            live_err = str(e)[:200]
+    try:
+        return pd.read_csv(f"data/{name}.csv")
+    except Exception:
+        raise RuntimeError(live_err or "DATABRICKS_WAREHOUSE_ID is not set and there are no CSV files.")
+
+
+ready, load_err = True, ""
 try:
-    price, locs, props = load("avg_price_by_city"), load("top_selling_locations"), load("property_type_demand")
+    price = get("avg_price_by_city", "avg_price_by_city_metrics")
+    locs = get("top_selling_locations", "top_selling_locations_metrics")
+    props = get("property_type_demand", "property_type_demand_metrics")
+    props = props.assign(sell_through=(props["total_units_sold"] / props["total_listing_count"] * 100).round(1))
 except Exception as e:
-    st.error(f"Could not load the data files in the data folder: {e}")
-    st.stop()
+    ready, load_err = False, str(e)
 
 
 def style(fig, h=420):
@@ -72,17 +109,16 @@ def style(fig, h=420):
     return fig
 
 
-props = props.assign(sell_through=(props["total_units_sold"] / props["total_listing_count"] * 100).round(1))
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Cities", locs["city"].nunique())
-c2.metric("Localities", f"{len(locs):,}")
-c3.metric("Units sold", f"{int(props['total_units_sold'].sum()):,}")
-c4.metric("Overall sell-through", f"{props['total_units_sold'].sum() / props['total_listing_count'].sum() * 100:.1f}%")
-
 tab1, tab2 = st.tabs(["Explore the market", "Ask the assistant"])
 
-# ---------- tab 1: interactive charts ----------
-with tab1:
+
+# ---------- tab 1: interactive charts (live from Databricks) ----------
+def charts():
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cities", locs["city"].nunique())
+    c2.metric("Localities", f"{len(locs):,}")
+    c3.metric("Units sold", f"{int(props['total_units_sold'].sum()):,}")
+    c4.metric("Overall sell-through", f"{props['total_units_sold'].sum() / props['total_listing_count'].sum() * 100:.1f}%")
     st.subheader("Prices by city")
     num = price.select_dtypes("number").columns.tolist()
     cat = next((c for c in price.columns if c not in num), price.columns[0])
@@ -173,3 +209,10 @@ with tab2:
                             answer = f"The assistant could not answer right now. {e}"
                     st.markdown(answer)
                 st.session_state.msgs.append({"role": "assistant", "content": answer})
+
+
+with tab1:
+    if ready:
+        charts()
+    else:
+        st.warning(f"The charts could not load the data: {load_err}")
