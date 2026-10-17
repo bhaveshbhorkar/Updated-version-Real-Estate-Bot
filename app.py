@@ -65,7 +65,8 @@ def query(table):
     r = requests.post(f"{HOST}/api/2.0/sql/statements", headers=h, timeout=60, json={
         "warehouse_id": WAREHOUSE, "statement": f"SELECT * FROM workspace.semantic.{table}",
         "wait_timeout": "50s", "on_wait_timeout": "CONTINUE"})
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
     j, t0 = r.json(), time.time()
     while j["status"]["state"] in ("PENDING", "RUNNING") and time.time() - t0 < 180:
         time.sleep(3)
@@ -86,7 +87,7 @@ def get(name, table):
         try:
             return query(table)
         except Exception as e:
-            live_err = str(e)[:200]
+            live_err = str(e)[:400]
     try:
         return pd.read_csv(f"data/{name}.csv")
     except Exception:
